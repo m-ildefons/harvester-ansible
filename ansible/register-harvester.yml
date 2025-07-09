@@ -1,0 +1,195 @@
+---
+- name: Install Harvester and Rancher
+  hosts:
+    - localhost
+  gather_facts: false
+  vars:
+
+    harvester_cluster_name: foobar1234
+    harvester_endpoint: https://192.168.0.131
+    harvester_username: admin
+    harvester_password: password1234
+    harvester_kubeconfig_path: /tmp/harvester-kubeconfig
+    harvester_init: true
+
+    rancher_endpoint: https://rancher.10.115.252.56.sslip.io
+    rancher_username: admin
+    rancher_password: password1234
+    rancher_kubeconfig_path: /tmp/rancher-kubeconfig
+    rancher_init: true
+
+  tasks:
+
+    - name: Initialize Harvester
+      block:
+
+        - name: Check that Harvester API is ready
+          harvester.version:
+            api:
+              endpoint: "{{ harvester_endpoint }}"
+              tls_verify: false
+              username: "{{ harvester_username }}"
+              password: 'admin'  # this is the default
+          ignore_errors: true
+          register: harvester
+          until:
+            - harvester is succeeded
+            - harvester.cluster_version != ''
+          retries: 60
+          delay: 5
+
+        - name: Change Harvester Admin Password
+          harvester.changepassword:
+            api:
+              endpoint: "{{ harvester_endpoint }}"
+              tls_verify: false  # if certificates aren't set up correctly yet
+              username: "{{ harvester_username }}"
+              password: 'admin'  # this is the default
+            new_password: "{{ harvester_password }}"
+
+        - name: Get Harvester Kubeconfig
+          harvester.get_kubeconfig:
+            api:
+              endpoint: "{{ harvester_endpoint }}"
+              tls_verify: false
+              username: "{{ harvester_username }}"
+              password: "{{ harvester_password }}"
+            path: "{{ harvester_kubeconfig_path }}"
+
+      when: harvester_init | bool
+
+    - name: Initialize Rancher
+      block:
+
+        - name: Check that Rancher API is ready
+          rancher.version:
+            api:
+              endpoint: "{{ rancher_endpoint }}"
+              tls_verify: false
+              username: "{{ rancher_username }}"
+              password: "{{ rancher_password }}"
+          ignore_errors: true
+          register: rancher
+          until:
+            - rancher is succeeded
+            - rancher.k8s_version != ''
+          retries: 60
+          delay: 5
+
+        - name: Get Rancher Kubeconfig
+          rancher.get_kubeconfig:
+            api:
+              endpoint: "{{ rancher_endpoint }}"
+              tls_verify: false
+              username: "{{ rancher_username }}"
+              password: "{{ rancher_password }}"
+            path: "{{ rancher_kubeconfig_path }}"
+
+        - name: Initialize Rancher Server URL
+          kubernetes.core.k8s:
+            kubeconfig: "{{ rancher_kubeconfig_path }}"
+            validate_certs: false
+            state: present
+            definition:
+              apiVersion: management.cattle.io/v3
+              kind: Setting
+              metadata:
+                name: server-url
+              value: "{{ rancher_endpoint }}"
+          when: rancher.server_url != rancher_endpoint
+
+      when: rancher_init | bool
+
+    - name: Register Harvester Cluster
+      block:
+
+        - name: Create new Harvester Management Cluster in Rancher
+          kubernetes.core.k8s:
+            kubeconfig: "{{ rancher_kubeconfig_path }}"
+            validate_certs: false
+            state: present
+            definition:
+              apiVersion: provisioning.cattle.io/v1
+              kind: Cluster
+              metadata:
+                annotations:
+                  field.cattle.io/description: Created by Ansible Automation
+                labels:
+                  provider.cattle.io: harvester
+                name: "{{ harvester_cluster_name }}"
+                namespace: fleet-default
+              spec:
+                agentEnvVars: []
+
+
+        - name: Get Cluster ID
+          block:
+
+            - kubernetes.core.k8s_info:
+                kubeconfig: "{{ rancher_kubeconfig_path }}"
+                validate_certs: false
+                api_version: provisioning.cattle.io/v1
+                kind: Cluster
+                name: "{{ harvester_cluster_name }}"
+                namespace: fleet-default
+              register: cluster
+              until:
+                - cluster is succeeded
+                - cluster.resources is defined
+                - cluster.resources | length > 0
+                - cluster.resources[0].status is defined
+                - cluster.resources[0].status.clusterName != ''
+              retries: 5
+              delay: 10
+
+            - set_fact:
+                cluster_id: "{{ cluster.resources[0].status.clusterName }}"
+
+        - name: Create Cluster Registration Token
+          kubernetes.core.k8s:
+            kubeconfig: "{{ rancher_kubeconfig_path }}"
+            validate_certs: false
+            state: present
+            definition:
+              apiVersion: management.cattle.io/v3
+              kind: ClusterRegistrationToken
+              metadata:
+                name: default-token
+                namespace: "{{ cluster_id }}"
+              spec:
+                clusterName: "{{ cluster_id }}"
+          register: token
+
+        - name: Get Manifest URL from Cluster Registration Token
+          block:
+
+            - kubernetes.core.k8s_info:
+                kubeconfig: "{{ rancher_kubeconfig_path }}"
+                validate_certs: false
+                api_version: management.cattle.io/v3
+                kind: ClusterRegistrationToken
+                namespace: "{{ cluster_id }}"
+                name: default-token
+              register: token
+              until:
+                - token is succeeded
+                - token.resources is defined
+                - token.resources | length > 0
+                - token.resources[0].status is defined
+                - token.resources[0].status.manifestUrl != ''
+              retries: 20
+              delay: 10
+
+            - set_fact:
+                registration_url: "{{ token.resources[0].status.manifestUrl }}"
+
+        - name: Set registration URL
+          kubernetes.core.k8s:
+            kubeconfig: "{{ harvester_kubeconfig_path }}"
+            state: present
+            definition:
+              apiVersion: harvesterhci.io/v1beta1
+              kind: setting
+              metadata:
+                name: cluster-registration-url
+              value: "{{ registration_url }}"
